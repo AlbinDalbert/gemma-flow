@@ -4,7 +4,7 @@
 Intended Hyprland usage:
   bind = $mainMod, T, exec, /home/chell/.local/bin/gemma-flow toggle
 
-The script records with PipeWire (`pw-record`), sends a WAV to Ollama's
+The script records with PipeWire (`pw-record`), sends audio to Ollama's
 /api/generate using the multimodal `images` field, then pastes the cleaned text
 into the currently focused Wayland window via clipboard + Hyprland sendshortcut.
 """
@@ -37,7 +37,7 @@ except ModuleNotFoundError:  # pragma: no cover
     tomllib = None  # type: ignore[assignment]
 
 APP = "gemma-flow"
-NOTIFY_ID = "424242"
+SUPPORTED_TRANSCRIPTION_MODES = {"gemma_direct", "gemma_two_pass", "whisper_gemma"}
 DEFAULT_PROMPT = """Listen to this audio and output only the final dictated text.
 If there is no intelligible speech, output exactly: [silence]
 
@@ -47,19 +47,65 @@ Cleanup rules:
 - Keep the speaker's meaning and tone. Do not summarize or add ideas.
 - Do not treat spoken words like "comma", "period", or "new line" as editing commands; if spoken, keep them as normal words.
 - Output plain text only: no Markdown, labels, or commentary.
+- You can write lists when it's OBVIOUS it is a list being spoken out.
 """
+
+DEFAULT_RAW_AUDIO_PROMPT = """Transcribe this audio as literally as possible.
+If there is no intelligible speech, output exactly: [silence]
+
+Raw transcription rules:
+- Output only the words you can hear in the audio.
+- Do not summarize, rewrite, polish, or add missing ideas.
+- Preserve false starts, stutters, filler words, and repeated words when you hear them.
+- If a short span is unclear, write [inaudible] for that span.
+- Do not treat spoken words like "comma", "period", or "new line" as editing commands; if spoken, keep them as normal words.
+- Output plain text only: no Markdown, labels, or commentary.
+"""
+
+DEFAULT_CLEANUP_PROMPT = """Clean up this raw dictation transcript into the final text to insert.
+If the transcript is empty, silence, or only [inaudible], output exactly: [silence]
+
+Cleanup rules:
+- Add natural punctuation and capitalization.
+- Remove obvious stutters, filler words, and accidental repeated words when they do not change meaning.
+- Keep the speaker's meaning and tone. Do not summarize or add ideas.
+- Do not treat words like "comma", "period", or "new line" as editing commands; if present, keep them as normal words.
+- You can write lists when it's OBVIOUS it is a list being spoken out.
+- Output plain text only: no Markdown, labels, or commentary.
+"""
+
+
+@dataclasses.dataclass(frozen=True)
+class TranscriptionResult:
+    text: str
+    raw: str
+    empty_reason: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
+class AudioStats:
+    duration_s: float | None
+    mean_db: float | None
+    max_db: float | None
+    size_bytes: int
 
 
 @dataclasses.dataclass(frozen=True)
 class Config:
     ollama_url: str = "http://ollama.lan"
     model: str = "gemma4:12b"
+    # gemma_direct: audio -> Gemma cleanup in one pass
+    # gemma_two_pass: audio -> Gemma raw transcript -> Gemma cleanup
+    # whisper_gemma: audio -> local whisper.cpp raw transcript -> Gemma cleanup
+    transcription_mode: str = "gemma_direct"
     request_timeout_s: float = 180.0
     temperature: float = 0.0
     num_predict: int = 768
     sample_rate: int = 16000
     channels: int = 1
     audio_format: str = "s16"
+    # Convert recordings before upload. FLAC keeps quality but makes the HTTP body much smaller.
+    upload_audio_format: str = "flac"
     paste_delay_s: float = 0.30
     # Empty = auto. Uses Ctrl+Shift+V for known terminal classes, Ctrl+V otherwise.
     paste_shortcut: str = ""
@@ -67,6 +113,18 @@ class Config:
     terminal_classes: tuple[str, ...] = ("Alacritty", "kitty", "foot", "footclient", "org.wezfurlong.wezterm", "com.mitchellh.ghostty")
     min_recording_s: float = 0.35
     prompt: str = DEFAULT_PROMPT
+    raw_audio_prompt: str = DEFAULT_RAW_AUDIO_PROMPT
+    cleanup_prompt: str = DEFAULT_CLEANUP_PROMPT
+    # Hints shared by Whisper and the Gemma cleanup pass for proper nouns / niche vocabulary.
+    cleanup_context: str = ""
+    cleanup_vocabulary: tuple[str, ...] = ()
+    phrase_replacements: dict[str, str] = dataclasses.field(default_factory=dict)
+    whisper_command: str = ""
+    whisper_model: str = "base.en"
+    whisper_model_path: str = ""
+    whisper_language: str = "en"
+    whisper_threads: int = 0
+    whisper_extra_args: tuple[str, ...] = ()
     notify: bool = True
     debug_keep_temp: bool = False
 
@@ -169,26 +227,70 @@ def pid_alive(pid: int) -> bool:
         return True
 
 
+def notify_state_file() -> Path:
+    return xdg_runtime_dir() / "notification.json"
+
+
+def read_notify_state() -> dict[str, int]:
+    try:
+        data = json.loads(notify_state_file().read_text())
+        return {"id": int(data.get("id", 0)), "generation": int(data.get("generation", 0))}
+    except Exception:
+        return {"id": 0, "generation": 0}
+
+
+def write_notify_state(notification_id: int, generation: int) -> None:
+    path = notify_state_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"id": notification_id, "generation": generation}))
+    tmp.replace(path)
+
+
+def schedule_mako_dismiss(notification_id: int, generation: int, expire_ms: int) -> None:
+    if expire_ms <= 0 or shutil.which("makoctl") is None:
+        return
+    delay = max(0.0, expire_ms / 1000.0)
+    state_path = str(notify_state_file())
+    # Mako on this machine ignores notify-send's expire timeout in some cases.
+    # Dismiss only if this exact notification generation is still current, so an
+    # old timeout cannot hide a newer listening/thinking notification.
+    script = (
+        "sleep \"$1\"; "
+        "gen=$(python -c 'import json,sys; "
+        "print(json.load(open(sys.argv[1])).get(\"generation\", -1))' \"$2\" 2>/dev/null); "
+        "[ \"$gen\" = \"$4\" ] && makoctl dismiss -n \"$3\" -h >/dev/null 2>&1 || true"
+    )
+    subprocess.Popen(
+        ["sh", "-c", script, "sh", f"{delay:.3f}", state_path, str(notification_id), str(generation)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
 def notify(summary: str, body: str = "", *, urgency: str = "normal", expire_ms: int = 2500, cfg: Config | None = None) -> None:
     if cfg is not None and not cfg.notify:
         return
     if shutil.which("notify-send") is None:
         return
-    cmd = [
-        "notify-send",
-        "-a",
-        APP,
-        "-r",
-        NOTIFY_ID,
-        "-u",
-        urgency,
-        "-t",
-        str(expire_ms),
-        summary,
-    ]
+
+    previous = read_notify_state()
+    generation = previous["generation"] + 1
+    cmd = ["notify-send", "-p", "-a", APP]
+    if previous["id"] > 0:
+        cmd += ["-r", str(previous["id"])]
+    cmd += ["-u", urgency, "-t", str(expire_ms), summary]
     if body:
         cmd.append(body)
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False)
+        notification_id = int((result.stdout or "").strip().splitlines()[-1])
+    except Exception:
+        return
+    write_notify_state(notification_id, generation)
+    schedule_mako_dismiss(notification_id, generation, expire_ms)
 
 
 def require_cmd(name: str) -> None:
@@ -254,13 +356,99 @@ def stop_recorder(pid: int, timeout_s: float = 3.0) -> None:
         time.sleep(0.05)
 
 
-def ollama_generate_with_audio(cfg: Config, audio_path: Path) -> str:
+@contextlib.contextmanager
+def upload_audio_path(cfg: Config, source_path: Path):
+    fmt = cfg.upload_audio_format.strip().lower()
+    if fmt in {"", "source", "original"}:
+        yield source_path
+        return
+    if fmt != "flac":
+        raise RuntimeError(f"Unsupported upload_audio_format: {cfg.upload_audio_format!r}")
+    if shutil.which("ffmpeg") is None:
+        # WAV upload still works; FLAC is only to shrink the request body.
+        yield source_path
+        return
+
+    runtime = xdg_runtime_dir()
+    runtime.mkdir(parents=True, exist_ok=True)
+    tmp = tempfile.NamedTemporaryFile(prefix=f"{APP}-upload-", suffix=".flac", dir=runtime, delete=False)
+    upload_path = Path(tmp.name)
+    tmp.close()
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(source_path),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "flac",
+                str(upload_path),
+            ],
+            check=True,
+        )
+        yield upload_path
+    finally:
+        if not cfg.debug_keep_temp:
+            with contextlib.suppress(FileNotFoundError):
+                upload_path.unlink()
+
+
+def dropped_upload_message(cfg: Config, audio_path: Path, payload_bytes: bytes, reason: object) -> str:
+    size_mib = len(payload_bytes) / (1024 * 1024)
+    file_mib = audio_path.stat().st_size / (1024 * 1024) if audio_path.exists() else 0.0
+    return (
+        f"Ollama dropped the audio upload ({audio_path.name}, {file_mib:.1f} MiB file, "
+        f"{size_mib:.1f} MiB request): {reason}. This is usually a proxy/ingress body-size "
+        "limit or the Ollama pod restarting. Try again; if it repeats on longer clips, raise "
+        "the request body limit for ollama.lan."
+    )
+
+
+def ollama_generate_payload(cfg: Config, payload: dict[str, Any], *, audio_path: Path | None = None) -> dict[str, Any]:
+    payload_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    url = cfg.ollama_url.rstrip("/") + "/api/generate"
+    req = urllib.request.Request(
+        url,
+        data=payload_bytes,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=cfg.request_timeout_s) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        if audio_path is not None and e.code == 413:
+            raise RuntimeError(dropped_upload_message(cfg, audio_path, payload_bytes, "HTTP 413 payload too large")) from e
+        raise RuntimeError(f"Ollama HTTP {e.code}: {detail}") from e
+    except urllib.error.URLError as e:
+        reason = e.reason
+        if audio_path is not None and (
+            isinstance(reason, (BrokenPipeError, ConnectionResetError)) or "broken pipe" in str(reason).lower()
+        ):
+            raise RuntimeError(dropped_upload_message(cfg, audio_path, payload_bytes, reason)) from e
+        raise RuntimeError(f"Could not reach Ollama at {cfg.ollama_url}: {reason}") from e
+    except (BrokenPipeError, ConnectionResetError) as e:
+        if audio_path is not None:
+            raise RuntimeError(dropped_upload_message(cfg, audio_path, payload_bytes, e)) from e
+        raise RuntimeError(f"Could not reach Ollama at {cfg.ollama_url}: {e}") from e
+
+
+def ollama_generate_with_audio(cfg: Config, audio_path: Path, prompt: str | None = None) -> TranscriptionResult:
     audio_b64 = base64.b64encode(audio_path.read_bytes()).decode("ascii")
     payload: dict[str, Any] = {
         "model": cfg.model,
-        "prompt": cfg.prompt,
+        "prompt": cfg.prompt if prompt is None else prompt,
         # Ollama 0.30 accepts multimodal attachments here; despite the name,
-        # Gemma's mmproj can consume audio WAVs through this field.
+        # Gemma's mmproj can consume audio through this field.
         "images": [audio_b64],
         "stream": False,
         "think": False,
@@ -269,29 +457,31 @@ def ollama_generate_with_audio(cfg: Config, audio_path: Path) -> str:
             "num_predict": cfg.num_predict,
         },
     }
-    url = cfg.ollama_url.rstrip("/") + "/api/generate"
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=cfg.request_timeout_s) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Ollama HTTP {e.code}: {detail}") from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Could not reach Ollama at {cfg.ollama_url}: {e.reason}") from e
-
+    data = ollama_generate_payload(cfg, payload, audio_path=audio_path)
     if "error" in data:
         raise RuntimeError(f"Ollama error: {data['error']}")
     return clean_model_output(str(data.get("response", "")))
 
 
-def clean_model_output(text: str) -> str:
-    text = text.replace("\r\n", "\n").strip()
+def ollama_generate_text(cfg: Config, prompt: str) -> TranscriptionResult:
+    payload: dict[str, Any] = {
+        "model": cfg.model,
+        "prompt": prompt,
+        "stream": False,
+        "think": False,
+        "options": {
+            "temperature": cfg.temperature,
+            "num_predict": cfg.num_predict,
+        },
+    }
+    data = ollama_generate_payload(cfg, payload)
+    if "error" in data:
+        raise RuntimeError(f"Ollama error: {data['error']}")
+    return clean_model_output(str(data.get("response", "")))
+
+
+def clean_model_output(raw_text: str) -> TranscriptionResult:
+    text = raw_text.replace("\r\n", "\n").strip()
     text = re.sub(r"(?is)<think>.*?</think>", "", text).strip()
     text = re.sub(r"(?is)^```(?:text)?\s*", "", text).strip()
     text = re.sub(r"(?is)\s*```$", "", text).strip()
@@ -299,12 +489,96 @@ def clean_model_output(text: str) -> str:
     lowered = text.strip().lower()
     silence_responses = {"[silence]", "(silence)", "silence", "[no speech]", "no speech", ""}
     if lowered in silence_responses:
-        return ""
+        return TranscriptionResult("", raw_text, "model_silence")
     if "audio contains only silence" in lowered or "no intelligible speech" in lowered:
-        return ""
+        return TranscriptionResult("", raw_text, "model_silence")
     if "provide" in lowered and "audio" in lowered and ("file" in lowered or "link" in lowered):
-        return ""
-    return text
+        return TranscriptionResult("", raw_text, "missing_audio")
+    return TranscriptionResult(text, raw_text, "")
+
+
+def parse_db(value: str) -> float | None:
+    value = value.strip().lower()
+    if value in {"-inf", "inf", "+inf"}:
+        return None
+    with contextlib.suppress(ValueError):
+        return float(value)
+    return None
+
+
+def audio_stats(audio_path: Path) -> AudioStats:
+    duration_s: float | None = None
+    mean_db: float | None = None
+    max_db: float | None = None
+    size_bytes = audio_path.stat().st_size if audio_path.exists() else 0
+
+    if shutil.which("ffprobe") is not None:
+        with contextlib.suppress(Exception):
+            raw = subprocess.check_output(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(audio_path),
+                ],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+            duration_s = float(raw)
+
+    if shutil.which("ffmpeg") is not None:
+        with contextlib.suppress(Exception):
+            result = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-nostats", "-i", str(audio_path), "-af", "volumedetect", "-f", "null", "-"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            mean_match = re.search(r"mean_volume:\s*([-+]?inf|-?\d+(?:\.\d+)?)\s*dB", result.stderr)
+            max_match = re.search(r"max_volume:\s*([-+]?inf|-?\d+(?:\.\d+)?)\s*dB", result.stderr)
+            if mean_match:
+                mean_db = parse_db(mean_match.group(1))
+            if max_match:
+                max_db = parse_db(max_match.group(1))
+
+    return AudioStats(duration_s=duration_s, mean_db=mean_db, max_db=max_db, size_bytes=size_bytes)
+
+
+def fmt_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "unknown duration"
+    return f"{seconds:.1f}s"
+
+
+def empty_transcript_notification(result: TranscriptionResult, audio_path: Path) -> tuple[str, str, str, int, int]:
+    if result.empty_reason == "missing_audio":
+        return (
+            "Gemma Flow error",
+            "Gemma replied as if no audio was attached. That points to an Ollama/model attachment issue, not your mic.",
+            "critical",
+            7000,
+            1,
+        )
+
+    stats = audio_stats(audio_path)
+    peak = stats.max_db
+    if peak is None:
+        return "Gemma Flow", "No speech detected", "normal", 1800, 0
+
+    mean = stats.mean_db
+    stats_text = f"{fmt_duration(stats.duration_s)}, peak {peak:.0f} dB"
+    if mean is not None:
+        stats_text += f", mean {mean:.0f} dB"
+    if peak < -45 and (mean is None or mean < -55):
+        return "Gemma Flow", f"Captured near-silence ({stats_text}). Check mic/source/mute.", "critical", 5500, 1
+    if peak > -35 or (mean is not None and mean > -45):
+        return "Gemma Flow", f"Model returned no speech, but audio was captured ({stats_text}). Try again.", "normal", 3500, 0
+    return "Gemma Flow", f"No speech detected ({stats_text}).", "normal", 2500, 0
 
 
 @dataclasses.dataclass
@@ -378,6 +652,329 @@ def paste_text(text: str, cfg: Config) -> None:
     restore_clipboard(backup)
 
 
+def selected_transcription_mode(cfg: Config) -> str:
+    raw = cfg.transcription_mode.strip().lower().replace("-", "_")
+    aliases = {
+        "gemma": "gemma_direct",
+        "direct": "gemma_direct",
+        "one_pass": "gemma_direct",
+        "gemma_1_pass": "gemma_direct",
+        "two": "gemma_two_pass",
+        "two_pass": "gemma_two_pass",
+        "2_pass": "gemma_two_pass",
+        "gemma_2_pass": "gemma_two_pass",
+        "whisper": "whisper_gemma",
+        "whisper_cpp": "whisper_gemma",
+        "whisper_then_gemma": "whisper_gemma",
+    }
+    mode = aliases.get(raw, raw)
+    if mode not in SUPPORTED_TRANSCRIPTION_MODES:
+        choices = ", ".join(sorted(SUPPORTED_TRANSCRIPTION_MODES))
+        raise RuntimeError(f"Unsupported transcription_mode {cfg.transcription_mode!r}; choose one of: {choices}")
+    return mode
+
+
+def debug_write_text(cfg: Config, state: dict[str, Any] | None, name: str, text: str) -> None:
+    if not cfg.debug_keep_temp:
+        return
+    temp_dir = state.get("temp_dir") if state else None
+    if not temp_dir:
+        return
+    with contextlib.suppress(Exception):
+        path = Path(str(temp_dir)) / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+
+def cleanup_terms(cfg: Config) -> list[str]:
+    if isinstance(cfg.cleanup_vocabulary, str):
+        raw_terms: Any = [cfg.cleanup_vocabulary]
+    else:
+        raw_terms = cfg.cleanup_vocabulary
+    return [str(term).strip() for term in raw_terms if str(term).strip()]
+
+
+def replacement_pairs(cfg: Config) -> list[tuple[str, str]]:
+    if not isinstance(cfg.phrase_replacements, dict):
+        raise RuntimeError("phrase_replacements must be a TOML table of source = replacement strings")
+    pairs: list[tuple[str, str]] = []
+    for source, target in cfg.phrase_replacements.items():
+        source_s = str(source).strip()
+        target_s = str(target).strip()
+        if source_s and target_s:
+            pairs.append((source_s, target_s))
+    return pairs
+
+
+def apply_phrase_replacements(text: str, cfg: Config) -> str:
+    for source, target in replacement_pairs(cfg):
+        pattern = re.escape(source)
+        if source[0].isalnum() or source[0] == "_":
+            pattern = r"(?<!\w)" + pattern
+        if source[-1].isalnum() or source[-1] == "_":
+            pattern += r"(?!\w)"
+        text = re.sub(pattern, target, text, flags=re.IGNORECASE)
+    return text
+
+
+def dictation_hints_for_gemma(cfg: Config) -> str:
+    sections: list[str] = []
+    context = cfg.cleanup_context.strip()
+    if context:
+        sections.append(f"Context:\n{context}")
+
+    terms = cleanup_terms(cfg)
+    if terms:
+        sections.append("Preferred vocabulary / spellings:\n" + "\n".join(f"- {term}" for term in terms))
+
+    pairs = replacement_pairs(cfg)
+    if pairs:
+        sections.append(
+            "Known likely ASR substitutions:\n"
+            + "\n".join(f'- If the raw transcript says "{source}", prefer "{target}" when it fits the sentence.' for source, target in pairs)
+        )
+
+    if not sections:
+        return ""
+    return (
+        "Dictation hints:\n"
+        + "\n\n".join(sections)
+        + "\n\nUse these hints to correct plausible ASR homophones, especially proper nouns and technical terms. "
+        + "Do not force a hint if it clearly does not fit the sentence.\n"
+    )
+
+
+def whisper_initial_prompt(cfg: Config) -> str:
+    terms = cleanup_terms(cfg)
+    preferred_from_pairs = [target for _source, target in replacement_pairs(cfg) if target not in terms]
+    words = terms + preferred_from_pairs
+    if not words:
+        return ""
+    # whisper.cpp treats this as prior text/context, not an instruction. Keep it compact.
+    return "Technical vocabulary: " + ", ".join(words[:80])
+
+
+def has_whisper_prompt_arg(args: list[str]) -> bool:
+    return any(arg == "--prompt" or arg.startswith("--prompt=") for arg in args)
+
+
+def cleanup_transcript_with_gemma(cfg: Config, raw_text: str, state: dict[str, Any] | None) -> TranscriptionResult:
+    cleaned_input = apply_phrase_replacements(raw_text.strip(), cfg)
+    if cleaned_input != raw_text.strip():
+        debug_write_text(cfg, state, "raw-transcript-after-replacements.txt", cleaned_input)
+    hints = dictation_hints_for_gemma(cfg)
+    prompt = f'{cfg.cleanup_prompt.rstrip()}\n\n{hints}Raw transcript:\n"""\n{cleaned_input}\n"""\n'
+    debug_write_text(cfg, state, "cleanup-prompt.txt", prompt)
+    result = ollama_generate_text(cfg, prompt)
+    debug_write_text(cfg, state, "cleanup-model-response.txt", result.raw)
+    if not result.text and cleaned_input:
+        # If the editor pass flakes, raw transcript is safer than dropping the dictation.
+        return TranscriptionResult(cleaned_input, result.raw, "")
+    if result.text:
+        corrected = apply_phrase_replacements(result.text, cfg)
+        return TranscriptionResult(corrected, result.raw, result.empty_reason)
+    return result
+
+
+def transcribe_gemma_direct(cfg: Config, audio_path: Path, state: dict[str, Any]) -> TranscriptionResult:
+    notify("Gemma Flow", "◌ Thinking…", expire_ms=120000, cfg=cfg)
+    with upload_audio_path(cfg, audio_path) as prepared_audio:
+        result = ollama_generate_with_audio(cfg, prepared_audio, cfg.prompt)
+    debug_write_text(cfg, state, "gemma-direct-response.txt", result.raw)
+    return result
+
+
+def transcribe_gemma_two_pass(cfg: Config, audio_path: Path, state: dict[str, Any]) -> TranscriptionResult:
+    notify("Gemma Flow", "◌ Transcribing audio…", expire_ms=120000, cfg=cfg)
+    with upload_audio_path(cfg, audio_path) as prepared_audio:
+        raw_result = ollama_generate_with_audio(cfg, prepared_audio, cfg.raw_audio_prompt)
+    debug_write_text(cfg, state, "raw-audio-model-response.txt", raw_result.raw)
+    debug_write_text(cfg, state, "raw-transcript.txt", raw_result.text)
+    if not raw_result.text:
+        return raw_result
+
+    notify("Gemma Flow", "◌ Cleaning transcript…", expire_ms=120000, cfg=cfg)
+    return cleanup_transcript_with_gemma(cfg, raw_result.text, state)
+
+
+def resolve_whisper_command(cfg: Config) -> str:
+    configured = cfg.whisper_command.strip()
+    if configured:
+        expanded = Path(configured).expanduser()
+        if expanded.exists():
+            return str(expanded)
+        found = shutil.which(configured)
+        if found:
+            return found
+        raise RuntimeError(f"whisper_command not found: {configured}")
+
+    for name in ("whisper-cli", "whisper.cpp"):
+        found = shutil.which(name)
+        if found:
+            return found
+
+    common_paths = [
+        Path.home() / "opt" / "whisper.cpp" / "build" / "bin" / "whisper-cli",
+        Path.home() / "src" / "whisper.cpp" / "build" / "bin" / "whisper-cli",
+        Path.home() / "repos" / "whisper.cpp" / "build" / "bin" / "whisper-cli",
+    ]
+    for path in common_paths:
+        if path.exists():
+            return str(path)
+    raise RuntimeError("whisper_gemma mode requires whisper.cpp. Install it and set whisper_model_path if needed.")
+
+
+def candidate_whisper_model_paths(model: str) -> list[Path]:
+    model = model.strip()
+    if not model:
+        model = "base.en"
+
+    direct = Path(model).expanduser()
+    candidates: list[Path] = []
+    if direct.is_absolute() or "/" in model:
+        candidates.append(direct)
+
+    if model.endswith(".bin"):
+        names = [model]
+    else:
+        names = [f"ggml-{model}.bin", f"{model}.bin"]
+
+    xdg_data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    bases = [
+        xdg_data_home / "whisper.cpp",
+        xdg_data_home / "whisper.cpp" / "models",
+        Path.home() / "opt" / "whisper.cpp" / "models",
+        Path.home() / "src" / "whisper.cpp" / "models",
+        Path.home() / "repos" / "whisper.cpp" / "models",
+        Path.home() / ".cache" / "whisper.cpp",
+        Path.home() / ".cache" / "whisper",
+        Path.home() / "models" / "whisper.cpp",
+        Path.home() / "models" / "whisper",
+        Path.cwd() / "models",
+        Path("/usr/share/whisper.cpp"),
+        Path("/usr/share/whisper.cpp/models"),
+        Path("/usr/local/share/whisper.cpp"),
+        Path("/usr/local/share/whisper.cpp/models"),
+    ]
+    for base in bases:
+        for name in names:
+            candidates.append(base / name)
+    return candidates
+
+
+def resolve_whisper_model_path(cfg: Config) -> Path:
+    if cfg.whisper_model_path.strip():
+        path = Path(cfg.whisper_model_path).expanduser()
+        if path.exists():
+            return path
+        raise RuntimeError(f"whisper_model_path does not exist: {path}")
+
+    candidates = candidate_whisper_model_paths(cfg.whisper_model)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    searched = "\n  ".join(str(p) for p in candidates[:10])
+    raise RuntimeError(
+        f"No whisper.cpp model found for {cfg.whisper_model!r}. Set whisper_model_path in config. Searched:\n  {searched}"
+    )
+
+
+def auto_whisper_threads(cfg: Config) -> int:
+    if cfg.whisper_threads > 0:
+        return cfg.whisper_threads
+    return max(1, min(4, os.cpu_count() or 1))
+
+
+def normalize_whisper_text(text: str) -> str:
+    lines: list[str] = []
+    for line in text.replace("\r\n", "\n").splitlines():
+        line = re.sub(r"^\s*\[[0-9:. ,]+-->\s*[0-9:. ,]+\]\s*", "", line).strip()
+        if line:
+            lines.append(line)
+    return " ".join(lines).strip()
+
+
+def run_whisper_cpp(cfg: Config, audio_path: Path, state: dict[str, Any]) -> str:
+    command = resolve_whisper_command(cfg)
+    model_path = resolve_whisper_model_path(cfg)
+    runtime = xdg_runtime_dir()
+    runtime.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix=f"{APP}-whisper-", dir=runtime) as td:
+        output_prefix = Path(td) / "transcript"
+        cmd = [
+            command,
+            "-m",
+            str(model_path),
+            "-f",
+            str(audio_path),
+            "-l",
+            cfg.whisper_language,
+            "-otxt",
+            "-of",
+            str(output_prefix),
+            "-nt",
+            "-t",
+            str(auto_whisper_threads(cfg)),
+        ]
+        extra_args = [str(arg) for arg in cfg.whisper_extra_args]
+        prompt = whisper_initial_prompt(cfg)
+        if prompt and not has_whisper_prompt_arg(extra_args):
+            cmd.extend(["--prompt", prompt])
+        cmd.extend(extra_args)
+        debug_write_text(cfg, state, "whisper-command.json", json.dumps(cmd, indent=2))
+
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=cfg.request_timeout_s,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"whisper.cpp timed out after {cfg.request_timeout_s:.0f}s") from e
+
+        debug_write_text(cfg, state, "whisper-stdout.txt", result.stdout or "")
+        debug_write_text(cfg, state, "whisper-stderr.txt", result.stderr or "")
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "unknown error").strip().splitlines()[-5:]
+            raise RuntimeError("whisper.cpp failed: " + " | ".join(detail))
+
+        txt_path = output_prefix.with_suffix(".txt")
+        raw = ""
+        if txt_path.exists():
+            raw = txt_path.read_text(encoding="utf-8", errors="replace")
+        if not raw.strip():
+            raw = result.stdout or ""
+    return normalize_whisper_text(raw)
+
+
+def transcribe_whisper_gemma(cfg: Config, audio_path: Path, state: dict[str, Any]) -> TranscriptionResult:
+    notify("Gemma Flow", "◌ Whisper transcribing…", expire_ms=120000, cfg=cfg)
+    raw_text = run_whisper_cpp(cfg, audio_path, state)
+    debug_write_text(cfg, state, "raw-transcript.txt", raw_text)
+    raw_result = clean_model_output(raw_text)
+    if not raw_result.text:
+        return TranscriptionResult("", raw_text, "whisper_silence")
+
+    notify("Gemma Flow", "◌ Cleaning transcript…", expire_ms=120000, cfg=cfg)
+    return cleanup_transcript_with_gemma(cfg, raw_result.text, state)
+
+
+def transcribe_audio(cfg: Config, audio_path: Path, state: dict[str, Any]) -> TranscriptionResult:
+    mode = selected_transcription_mode(cfg)
+    if mode == "gemma_direct":
+        return transcribe_gemma_direct(cfg, audio_path, state)
+    if mode == "gemma_two_pass":
+        return transcribe_gemma_two_pass(cfg, audio_path, state)
+    if mode == "whisper_gemma":
+        return transcribe_whisper_gemma(cfg, audio_path, state)
+    raise AssertionError(mode)
+
+
 def process_recording(cfg: Config, state: dict[str, Any], *, paste: bool = True, print_text: bool = False) -> int:
     audio_path = Path(str(state["audio_path"]))
     started_at = float(state.get("started_at", time.time()))
@@ -390,15 +987,15 @@ def process_recording(cfg: Config, state: dict[str, Any], *, paste: bool = True,
         notify("Gemma Flow", "No audio captured", urgency="critical", cfg=cfg)
         return 1
 
-    notify("Gemma Flow", "◌ Thinking…", expire_ms=120000, cfg=cfg)
-    text = ollama_generate_with_audio(cfg, audio_path)
+    result = transcribe_audio(cfg, audio_path, state)
     if print_text:
-        print(text)
-    if not text:
-        notify("Gemma Flow", "No speech detected", expire_ms=1600, cfg=cfg)
-        return 0
+        print(result.text)
+    if not result.text:
+        summary, body, urgency, expire_ms, code = empty_transcript_notification(result, audio_path)
+        notify(summary, body, urgency=urgency, expire_ms=expire_ms, cfg=cfg)
+        return code
     if paste:
-        paste_text(text, cfg)
+        paste_text(result.text, cfg)
         notify("Gemma Flow", "✓ Inserted text", expire_ms=1400, cfg=cfg)
     else:
         notify("Gemma Flow", "✓ Transcribed", expire_ms=1400, cfg=cfg)
@@ -517,6 +1114,17 @@ def ollama_json(cfg: Config, endpoint: str, payload: dict[str, Any] | None = Non
 
 def cmd_probe(cfg: Config) -> int:
     print(f"Ollama: {cfg.ollama_url}")
+    mode = selected_transcription_mode(cfg)
+    print(f"Transcription mode: {mode}")
+    if mode == "whisper_gemma":
+        try:
+            print(f"Whisper command: {resolve_whisper_command(cfg)}")
+            print(f"Whisper model: {resolve_whisper_model_path(cfg)}")
+            print(f"Whisper threads: {auto_whisper_threads(cfg)}")
+        except RuntimeError as e:
+            print(f"Whisper setup: {e}")
+            return 1
+
     version = ollama_json(cfg, "/api/version", timeout=8)
     print(f"Server version: {version.get('version', 'unknown')}")
 
@@ -568,7 +1176,7 @@ def cmd_probe(cfg: Config) -> int:
             num_predict=32,
         )
         response = ollama_generate_with_audio(probe_cfg, wav)
-        print("Silent WAV response:", response or "<empty/silence>")
+        print("Silent WAV response:", response.text or "<empty/silence>")
     return 0
 
 
@@ -582,22 +1190,41 @@ def write_default_config() -> None:
         "# gemma-flow config\n"
         "ollama_url = \"http://ollama.lan\"\n"
         "model = \"gemma4:12b\"\n"
+        "# One of: gemma_direct, gemma_two_pass, whisper_gemma\n"
+        "transcription_mode = \"gemma_direct\"\n"
         "request_timeout_s = 180\n"
         "temperature = 0\n"
         "num_predict = 768\n"
         "sample_rate = 16000\n"
         "channels = 1\n"
+        "# Upload FLAC to keep Kubernetes/proxy request bodies small. Use \"source\" to send the WAV directly.\n"
+        "upload_audio_format = \"flac\"\n"
         "paste_delay_s = 0.30\n"
         "# Empty = auto. Uses Ctrl+Shift+V for known terminal classes, Ctrl+V otherwise.\n"
         "paste_shortcut = \"\"\n"
         "terminal_paste_shortcut = \"CTRL SHIFT,V,activewindow\"\n"
         "terminal_classes = [\"Alacritty\", \"kitty\", \"foot\", \"footclient\", \"org.wezfurlong.wezterm\", \"com.mitchellh.ghostty\"]\n"
         "min_recording_s = 0.35\n"
+        "# whisper_gemma mode uses whisper.cpp locally for raw ASR, then Gemma for cleanup.\n"
+        "whisper_command = \"\"\n"
+        "whisper_model = \"base.en\"\n"
+        "whisper_model_path = \"\"\n"
+        "whisper_language = \"en\"\n"
+        "whisper_threads = 0\n"
+        "whisper_extra_args = []\n"
+        "# Hints for proper nouns, project names, and common ASR mishearings.\n"
+        "cleanup_context = \"\"\n"
+        "cleanup_vocabulary = []\n"
         "notify = true\n"
         "debug_keep_temp = false\n"
         "\n"
-        "# Override the dictation prompt if you want different cleanup behavior.\n"
-        "# prompt = \"\"\"...\"\"\"\n"
+        "# Override prompts if you want different behavior.\n"
+        "# prompt = \"\"\"...\"\"\"              # gemma_direct one-pass prompt\n"
+        "# raw_audio_prompt = \"\"\"...\"\"\"    # gemma_two_pass first pass\n"
+        "# cleanup_prompt = \"\"\"...\"\"\"      # gemma_two_pass / whisper_gemma second pass\n"
+        "#\n"
+        "# [phrase_replacements]\n"
+        "# \"Jammer\" = \"Gemma\"\n"
     )
     print(f"Wrote {path}")
 
