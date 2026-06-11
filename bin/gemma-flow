@@ -1,0 +1,655 @@
+#!/usr/bin/env python3
+"""Tiny local/self-hosted dictation client for Ollama multimodal Gemma.
+
+Intended Hyprland usage:
+  bind = $mainMod, T, exec, /home/chell/.local/bin/gemma-flow toggle
+
+The script records with PipeWire (`pw-record`), sends a WAV to Ollama's
+/api/generate using the multimodal `images` field, then pastes the cleaned text
+into the currently focused Wayland window via clipboard + Hyprland sendshortcut.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import contextlib
+import dataclasses
+import errno
+import fcntl
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # pragma: no cover
+    tomllib = None  # type: ignore[assignment]
+
+APP = "gemma-flow"
+NOTIFY_ID = "424242"
+DEFAULT_PROMPT = """Listen to this audio and output only the final dictated text.
+If there is no intelligible speech, output exactly: [silence]
+
+Cleanup rules:
+- Add natural punctuation and capitalization.
+- Remove obvious stutters, filler words, and accidental repeated words when they do not change meaning.
+- Keep the speaker's meaning and tone. Do not summarize or add ideas.
+- Do not treat spoken words like "comma", "period", or "new line" as editing commands; if spoken, keep them as normal words.
+- Output plain text only: no Markdown, labels, or commentary.
+"""
+
+
+@dataclasses.dataclass(frozen=True)
+class Config:
+    ollama_url: str = "http://ollama.lan"
+    model: str = "gemma4:12b"
+    request_timeout_s: float = 180.0
+    temperature: float = 0.0
+    num_predict: int = 768
+    sample_rate: int = 16000
+    channels: int = 1
+    audio_format: str = "s16"
+    paste_delay_s: float = 0.30
+    # Empty = auto. Uses Ctrl+Shift+V for known terminal classes, Ctrl+V otherwise.
+    paste_shortcut: str = ""
+    terminal_paste_shortcut: str = "CTRL SHIFT,V,activewindow"
+    terminal_classes: tuple[str, ...] = ("Alacritty", "kitty", "foot", "footclient", "org.wezfurlong.wezterm", "com.mitchellh.ghostty")
+    min_recording_s: float = 0.35
+    prompt: str = DEFAULT_PROMPT
+    notify: bool = True
+    debug_keep_temp: bool = False
+
+
+def xdg_runtime_dir() -> Path:
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    if base:
+        return Path(base) / APP
+    return Path(tempfile.gettempdir()) / f"{APP}-{os.getuid()}"
+
+
+def config_path() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME")
+    if base:
+        return Path(base) / APP / "config.toml"
+    return Path.home() / ".config" / APP / "config.toml"
+
+
+def load_config() -> Config:
+    path = config_path()
+    if not path.exists():
+        return Config()
+    if tomllib is None:
+        raise RuntimeError("This Python does not have tomllib; use Python 3.11+ or remove config.toml")
+    data = tomllib.loads(path.read_text())
+    allowed = {f.name for f in dataclasses.fields(Config)}
+    unknown = sorted(set(data) - allowed)
+    if unknown:
+        raise RuntimeError(f"Unknown config key(s) in {path}: {', '.join(unknown)}")
+    merged = dataclasses.asdict(Config())
+    merged.update(data)
+    return Config(**merged)
+
+
+class Lock:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.fd: int | None = None
+
+    def __enter__(self) -> "Lock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(self.fd)
+            self.fd = None
+            raise AlreadyRunning
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        if self.fd is not None:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+            self.fd = None
+
+
+class AlreadyRunning(RuntimeError):
+    pass
+
+
+def state_file() -> Path:
+    return xdg_runtime_dir() / "state.json"
+
+
+def lock_file() -> Path:
+    return xdg_runtime_dir() / "lock"
+
+
+def read_state() -> dict[str, Any] | None:
+    path = state_file()
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError:
+        return None
+
+
+def write_state(state: dict[str, Any]) -> None:
+    path = state_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(path)
+
+
+def clear_state() -> None:
+    with contextlib.suppress(FileNotFoundError):
+        state_file().unlink()
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def notify(summary: str, body: str = "", *, urgency: str = "normal", expire_ms: int = 2500, cfg: Config | None = None) -> None:
+    if cfg is not None and not cfg.notify:
+        return
+    if shutil.which("notify-send") is None:
+        return
+    cmd = [
+        "notify-send",
+        "-a",
+        APP,
+        "-r",
+        NOTIFY_ID,
+        "-u",
+        urgency,
+        "-t",
+        str(expire_ms),
+        summary,
+    ]
+    if body:
+        cmd.append(body)
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def require_cmd(name: str) -> None:
+    if shutil.which(name) is None:
+        raise RuntimeError(f"Required command not found: {name}")
+
+
+def start_recording(cfg: Config) -> None:
+    require_cmd("pw-record")
+    runtime = xdg_runtime_dir()
+    runtime.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(prefix=f"{APP}-", dir=runtime))
+    audio_path = temp_dir / "recording.wav"
+    log_path = temp_dir / "pw-record.log"
+
+    log = open(log_path, "wb")
+    cmd = [
+        "pw-record",
+        "--rate",
+        str(cfg.sample_rate),
+        "--channels",
+        str(cfg.channels),
+        "--format",
+        cfg.audio_format,
+        str(audio_path),
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    log.close()
+
+    write_state(
+        {
+            "status": "recording",
+            "pid": proc.pid,
+            "started_at": time.time(),
+            "audio_path": str(audio_path),
+            "temp_dir": str(temp_dir),
+        }
+    )
+    notify("Gemma Flow", "● Listening… press Super+T again to stop", expire_ms=120000, cfg=cfg)
+
+
+def stop_recorder(pid: int, timeout_s: float = 3.0) -> None:
+    if not pid_alive(pid):
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGINT)
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if not pid_alive(pid):
+            return
+        time.sleep(0.05)
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGTERM)
+    deadline = time.time() + 1.0
+    while time.time() < deadline:
+        if not pid_alive(pid):
+            return
+        time.sleep(0.05)
+
+
+def ollama_generate_with_audio(cfg: Config, audio_path: Path) -> str:
+    audio_b64 = base64.b64encode(audio_path.read_bytes()).decode("ascii")
+    payload: dict[str, Any] = {
+        "model": cfg.model,
+        "prompt": cfg.prompt,
+        # Ollama 0.30 accepts multimodal attachments here; despite the name,
+        # Gemma's mmproj can consume audio WAVs through this field.
+        "images": [audio_b64],
+        "stream": False,
+        "think": False,
+        "options": {
+            "temperature": cfg.temperature,
+            "num_predict": cfg.num_predict,
+        },
+    }
+    url = cfg.ollama_url.rstrip("/") + "/api/generate"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=cfg.request_timeout_s) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Ollama HTTP {e.code}: {detail}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Could not reach Ollama at {cfg.ollama_url}: {e.reason}") from e
+
+    if "error" in data:
+        raise RuntimeError(f"Ollama error: {data['error']}")
+    return clean_model_output(str(data.get("response", "")))
+
+
+def clean_model_output(text: str) -> str:
+    text = text.replace("\r\n", "\n").strip()
+    text = re.sub(r"(?is)<think>.*?</think>", "", text).strip()
+    text = re.sub(r"(?is)^```(?:text)?\s*", "", text).strip()
+    text = re.sub(r"(?is)\s*```$", "", text).strip()
+    text = re.sub(r"(?i)^\s*(final text|cleaned text|transcription|transcript)\s*:\s*", "", text).strip()
+    lowered = text.strip().lower()
+    silence_responses = {"[silence]", "(silence)", "silence", "[no speech]", "no speech", ""}
+    if lowered in silence_responses:
+        return ""
+    if "audio contains only silence" in lowered or "no intelligible speech" in lowered:
+        return ""
+    if "provide" in lowered and "audio" in lowered and ("file" in lowered or "link" in lowered):
+        return ""
+    return text
+
+
+@dataclasses.dataclass
+class ClipboardBackup:
+    mime: str | None
+    data: bytes | None
+
+
+def backup_clipboard() -> ClipboardBackup:
+    if shutil.which("wl-paste") is None:
+        return ClipboardBackup(None, None)
+    try:
+        types_raw = subprocess.check_output(["wl-paste", "--list-types"], stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        return ClipboardBackup(None, None)
+    types = [line.strip() for line in types_raw.decode("utf-8", errors="replace").splitlines() if line.strip()]
+    if not types:
+        return ClipboardBackup(None, None)
+
+    preferred = ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING"]
+    mime = next((m for m in preferred if m in types), types[0])
+    try:
+        data = subprocess.check_output(["wl-paste", "--type", mime], stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        return ClipboardBackup(None, None)
+    return ClipboardBackup(mime, data)
+
+
+def set_clipboard(data: bytes, mime: str = "text/plain;charset=utf-8") -> None:
+    require_cmd("wl-copy")
+    subprocess.run(["wl-copy", "--type", mime], input=data, check=True)
+
+
+def restore_clipboard(backup: ClipboardBackup) -> None:
+    if backup.mime and backup.data is not None:
+        with contextlib.suppress(Exception):
+            set_clipboard(backup.data, backup.mime)
+    elif shutil.which("wl-copy") is not None:
+        subprocess.run(["wl-copy", "--clear"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def paste_shortcut_for_active_window(cfg: Config) -> str:
+    if cfg.paste_shortcut:
+        return cfg.paste_shortcut
+    try:
+        raw = subprocess.check_output(["hyprctl", "activewindow", "-j"], stderr=subprocess.DEVNULL)
+        active = json.loads(raw.decode("utf-8"))
+        cls = str(active.get("class", "")).lower()
+    except Exception:
+        cls = ""
+    terminal_classes = {str(c).lower() for c in cfg.terminal_classes}
+    if cls in terminal_classes:
+        return cfg.terminal_paste_shortcut
+    return "CTRL,V,activewindow"
+
+
+def paste_text(text: str, cfg: Config) -> None:
+    require_cmd("wl-copy")
+    require_cmd("hyprctl")
+    backup = backup_clipboard()
+    set_clipboard(text.encode("utf-8"), "text/plain;charset=utf-8")
+    time.sleep(0.05)
+    shortcut = paste_shortcut_for_active_window(cfg)
+    subprocess.run(
+        ["hyprctl", "dispatch", "sendshortcut", shortcut],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    time.sleep(cfg.paste_delay_s)
+    restore_clipboard(backup)
+
+
+def process_recording(cfg: Config, state: dict[str, Any], *, paste: bool = True, print_text: bool = False) -> int:
+    audio_path = Path(str(state["audio_path"]))
+    started_at = float(state.get("started_at", time.time()))
+    elapsed = max(0.0, time.time() - started_at)
+
+    if elapsed < cfg.min_recording_s:
+        notify("Gemma Flow", "Too short; ignored", expire_ms=1400, cfg=cfg)
+        return 0
+    if not audio_path.exists() or audio_path.stat().st_size < 1024:
+        notify("Gemma Flow", "No audio captured", urgency="critical", cfg=cfg)
+        return 1
+
+    notify("Gemma Flow", "◌ Thinking…", expire_ms=120000, cfg=cfg)
+    text = ollama_generate_with_audio(cfg, audio_path)
+    if print_text:
+        print(text)
+    if not text:
+        notify("Gemma Flow", "No speech detected", expire_ms=1600, cfg=cfg)
+        return 0
+    if paste:
+        paste_text(text, cfg)
+        notify("Gemma Flow", "✓ Inserted text", expire_ms=1400, cfg=cfg)
+    else:
+        notify("Gemma Flow", "✓ Transcribed", expire_ms=1400, cfg=cfg)
+    return 0
+
+
+def cleanup_temp(state: dict[str, Any] | None, cfg: Config) -> None:
+    if cfg.debug_keep_temp or not state:
+        return
+    temp_dir = state.get("temp_dir")
+    if temp_dir:
+        shutil.rmtree(str(temp_dir), ignore_errors=True)
+
+
+def cmd_toggle(cfg: Config) -> int:
+    try:
+        with Lock(lock_file()):
+            state = read_state()
+            if state and state.get("status") == "recording" and pid_alive(int(state.get("pid", 0))):
+                write_state({**state, "status": "processing"})
+                stop_recorder(int(state["pid"]))
+                try:
+                    return process_recording(cfg, state, paste=True)
+                finally:
+                    cleanup_temp(state, cfg)
+                    clear_state()
+
+            # Stale or idle: start fresh.
+            if state:
+                cleanup_temp(state, cfg)
+                clear_state()
+            start_recording(cfg)
+            return 0
+    except AlreadyRunning:
+        notify("Gemma Flow", "Already processing…", expire_ms=1600, cfg=cfg)
+        return 0
+
+
+def cmd_start(cfg: Config) -> int:
+    try:
+        with Lock(lock_file()):
+            state = read_state()
+            if state and state.get("status") == "recording" and pid_alive(int(state.get("pid", 0))):
+                notify("Gemma Flow", "Already listening…", expire_ms=1600, cfg=cfg)
+                return 0
+            if state:
+                cleanup_temp(state, cfg)
+                clear_state()
+            start_recording(cfg)
+            return 0
+    except AlreadyRunning:
+        notify("Gemma Flow", "Already processing…", expire_ms=1600, cfg=cfg)
+        return 0
+
+
+def cmd_stop(cfg: Config, *, paste: bool = True, print_text: bool = False) -> int:
+    try:
+        with Lock(lock_file()):
+            state = read_state()
+            if not state or state.get("status") != "recording" or not pid_alive(int(state.get("pid", 0))):
+                notify("Gemma Flow", "Not recording", expire_ms=1200, cfg=cfg)
+                clear_state()
+                return 0
+            write_state({**state, "status": "processing"})
+            stop_recorder(int(state["pid"]))
+            try:
+                return process_recording(cfg, state, paste=paste, print_text=print_text)
+            finally:
+                cleanup_temp(state, cfg)
+                clear_state()
+    except AlreadyRunning:
+        notify("Gemma Flow", "Already processing…", expire_ms=1600, cfg=cfg)
+        return 0
+
+
+def cmd_cancel(cfg: Config) -> int:
+    with contextlib.suppress(AlreadyRunning):
+        with Lock(lock_file()):
+            state = read_state()
+            if state and state.get("status") == "recording":
+                with contextlib.suppress(Exception):
+                    stop_recorder(int(state.get("pid", 0)))
+            cleanup_temp(state, cfg)
+            clear_state()
+    notify("Gemma Flow", "Cancelled", expire_ms=1200, cfg=cfg)
+    return 0
+
+
+def cmd_status() -> int:
+    state = read_state()
+    if not state:
+        print("idle")
+        return 0
+    if state.get("status") == "recording" and not pid_alive(int(state.get("pid", 0))):
+        print("stale")
+        return 1
+    print(json.dumps(state, indent=2))
+    return 0
+
+
+def cmd_transcribe_file(cfg: Config, path: str, *, paste: bool) -> int:
+    audio_path = Path(path).expanduser()
+    if not audio_path.exists():
+        raise RuntimeError(f"No such audio file: {audio_path}")
+    fake_state = {"audio_path": str(audio_path), "started_at": time.time() - cfg.min_recording_s - 1}
+    return process_recording(cfg, fake_state, paste=paste, print_text=not paste)
+
+
+def ollama_json(cfg: Config, endpoint: str, payload: dict[str, Any] | None = None, timeout: float = 20.0) -> dict[str, Any]:
+    url = cfg.ollama_url.rstrip("/") + endpoint
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def cmd_probe(cfg: Config) -> int:
+    print(f"Ollama: {cfg.ollama_url}")
+    version = ollama_json(cfg, "/api/version", timeout=8)
+    print(f"Server version: {version.get('version', 'unknown')}")
+
+    tags = ollama_json(cfg, "/api/tags", timeout=12)
+    models = tags.get("models", [])
+    match = next((m for m in models if m.get("name") == cfg.model or m.get("model") == cfg.model), None)
+    if match:
+        print(f"Model: {cfg.model}")
+        caps = match.get("capabilities") or []
+        print("Capabilities:", ", ".join(caps) if caps else "unknown")
+    else:
+        print(f"Model {cfg.model!r} not found in /api/tags")
+        return 1
+
+    show = ollama_json(cfg, "/api/show", {"model": cfg.model}, timeout=20)
+    projector = show.get("projector_info") or {}
+    print("Audio projector:", bool(projector.get("clip.has_audio_encoder")))
+    print("Vision projector:", bool(projector.get("clip.has_vision_encoder")))
+
+    with tempfile.TemporaryDirectory(prefix=f"{APP}-probe-") as td:
+        wav = Path(td) / "silence.wav"
+        if shutil.which("ffmpeg"):
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anullsrc=r=16000:cl=mono",
+                    "-t",
+                    "0.25",
+                    "-c:a",
+                    "pcm_s16le",
+                    str(wav),
+                ],
+                check=True,
+            )
+        else:
+            # Minimal valid-ish WAV generation is not worth hand-rolling here.
+            print("ffmpeg not found; skipped live audio attachment test")
+            return 0
+        probe_cfg = dataclasses.replace(
+            cfg,
+            prompt="Transcribe this audio. If there is no speech, reply exactly: [silence]",
+            request_timeout_s=45,
+            num_predict=32,
+        )
+        response = ollama_generate_with_audio(probe_cfg, wav)
+        print("Silent WAV response:", response or "<empty/silence>")
+    return 0
+
+
+def write_default_config() -> None:
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        print(f"Config already exists: {path}")
+        return
+    path.write_text(
+        "# gemma-flow config\n"
+        "ollama_url = \"http://ollama.lan\"\n"
+        "model = \"gemma4:12b\"\n"
+        "request_timeout_s = 180\n"
+        "temperature = 0\n"
+        "num_predict = 768\n"
+        "sample_rate = 16000\n"
+        "channels = 1\n"
+        "paste_delay_s = 0.30\n"
+        "# Empty = auto. Uses Ctrl+Shift+V for known terminal classes, Ctrl+V otherwise.\n"
+        "paste_shortcut = \"\"\n"
+        "terminal_paste_shortcut = \"CTRL SHIFT,V,activewindow\"\n"
+        "terminal_classes = [\"Alacritty\", \"kitty\", \"foot\", \"footclient\", \"org.wezfurlong.wezterm\", \"com.mitchellh.ghostty\"]\n"
+        "min_recording_s = 0.35\n"
+        "notify = true\n"
+        "debug_keep_temp = false\n"
+        "\n"
+        "# Override the dictation prompt if you want different cleanup behavior.\n"
+        "# prompt = \"\"\"...\"\"\"\n"
+    )
+    print(f"Wrote {path}")
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog=APP)
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("toggle", help="Start recording, or stop/process/paste if already recording")
+    sub.add_parser("start", help="Start recording")
+    p_stop = sub.add_parser("stop", help="Stop recording, transcribe, and paste")
+    p_stop.add_argument("--no-paste", action="store_true", help="Print transcript instead of pasting")
+    sub.add_parser("cancel", help="Stop and discard current recording")
+    sub.add_parser("status", help="Print current state")
+    p_file = sub.add_parser("transcribe-file", help="Transcribe an existing audio file")
+    p_file.add_argument("path")
+    p_file.add_argument("--paste", action="store_true", help="Paste instead of printing")
+    sub.add_parser("probe", help="Check Ollama/model/audio attachment support")
+    sub.add_parser("write-config", help="Create ~/.config/gemma-flow/config.toml")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        if args.command == "write-config":
+            write_default_config()
+            return 0
+        cfg = load_config()
+        if args.command == "toggle":
+            return cmd_toggle(cfg)
+        if args.command == "start":
+            return cmd_start(cfg)
+        if args.command == "stop":
+            return cmd_stop(cfg, paste=not args.no_paste, print_text=args.no_paste)
+        if args.command == "cancel":
+            return cmd_cancel(cfg)
+        if args.command == "status":
+            return cmd_status()
+        if args.command == "transcribe-file":
+            return cmd_transcribe_file(cfg, args.path, paste=args.paste)
+        if args.command == "probe":
+            return cmd_probe(cfg)
+        raise RuntimeError(f"Unknown command: {args.command}")
+    except KeyboardInterrupt:
+        return 130
+    except Exception as e:
+        with contextlib.suppress(Exception):
+            cfg = load_config()
+            notify("Gemma Flow error", str(e), urgency="critical", expire_ms=6000, cfg=cfg)
+        print(f"{APP}: error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
